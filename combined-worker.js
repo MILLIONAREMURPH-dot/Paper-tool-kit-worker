@@ -1,19 +1,19 @@
 /**
  * Paper Toolkit — Combined Proxy Worker
  * ==========================================
- * ONE Cloudflare Worker handling BOTH:
+ * ONE Cloudflare Worker handling THREE routes:
  *   POST /rewrite    -> AI rewrite (via OpenAI)
  *   POST /copyscape  -> Web plagiarism check (via Copyscape Premium API)
+ *   POST /bookqa     -> AI explains an answer found in e-book excerpts (via OpenAI)
  *
  * SETUP (after deploying this to a Worker)
  * -------------------------------------------------
  * Settings -> Variables and Secrets, add:
- *   OPENAI_API_KEY       = your OpenAI API key       (needed for /rewrite)
+ *   OPENAI_API_KEY       = your OpenAI API key       (needed for /rewrite and /bookqa)
  *   COPYSCAPE_USERNAME    = your Copyscape username   (needed for /copyscape)
  *   COPYSCAPE_API_KEY     = your Copyscape API key    (needed for /copyscape)
  *
  * You can add just OPENAI_API_KEY now and skip Copyscape until later.
- * Then copy this Worker's URL and paste it into the app's Setup tab.
  */
 
 const CORS_HEADERS = {
@@ -27,6 +27,31 @@ function jsonResponse(obj, status = 200) {
     status,
     headers: { "Content-Type": "application/json", ...CORS_HEADERS },
   });
+}
+
+async function callOpenAI(env, systemPrompt, userContent, temperature) {
+  const payload = {
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userContent },
+    ],
+    temperature: temperature,
+  };
+  const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + env.OPENAI_API_KEY,
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await aiResp.json();
+  if (data.error) throw new Error(data.error.message || "OpenAI API error");
+  const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content
+    ? data.choices[0].message.content.trim() : null;
+  if (!content) throw new Error("No content returned from model");
+  return content;
 }
 
 async function handleRewrite(request, env) {
@@ -66,32 +91,51 @@ async function handleRewrite(request, env) {
     "- The final result should read as though the original author simply wrote a better second draft of their own paper.\n" +
     "- Output ONLY the rewritten paper text. No preamble, no explanation, no notes, no markdown formatting.";
 
-  const payload = {
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: text },
-    ],
-    temperature: 0.85,
-  };
-
   try {
-    const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer " + env.OPENAI_API_KEY,
-      },
-      body: JSON.stringify(payload),
-    });
-    const data = await aiResp.json();
-    if (data.error) return jsonResponse({ error: data.error.message || "OpenAI API error" }, 502);
-    const rewritten = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content
-      ? data.choices[0].message.content.trim() : null;
-    if (!rewritten) return jsonResponse({ error: "No content returned from model" }, 502);
+    const rewritten = await callOpenAI(env, systemPrompt, text, 0.85);
     return jsonResponse({ rewritten });
   } catch (err) {
-    return jsonResponse({ error: "Request to AI provider failed", detail: String(err) }, 502);
+    return jsonResponse({ error: String(err.message || err) }, 502);
+  }
+}
+
+async function handleBookQA(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+
+  const question = (body.question || "").slice(0, 1000);
+  const excerpts = Array.isArray(body.excerpts) ? body.excerpts.slice(0, 5) : [];
+
+  if (!question.trim()) return jsonResponse({ error: "No question provided" }, 400);
+  if (!excerpts.length) return jsonResponse({ error: "No excerpts provided" }, 400);
+  if (!env.OPENAI_API_KEY) {
+    return jsonResponse({ error: "Server missing OPENAI_API_KEY. Add it as an encrypted secret in the Worker's settings." }, 500);
+  }
+
+  const systemPrompt = "You are a patient, knowledgeable study tutor helping a graduate student (a U.S. Navy service member working toward a Master's in Healthcare Administration) understand their textbook. " +
+    "You will be given several excerpts from the book, each labeled with its location (a page or chapter number), and a question. " +
+    "Your job:\n" +
+    "1. Find the information in the provided excerpts that answers the question. Use ONLY the provided excerpts — do not use outside knowledge or invent information not present in them.\n" +
+    "2. Write a clear, friendly, conversational explanation that both teaches the underlying concept AND directly answers the specific question asked. Avoid dry textbook phrasing; explain it the way a good tutor would, in plain language.\n" +
+    "3. If the excerpts genuinely do not contain the answer, say so honestly instead of guessing or making something up.\n" +
+    "4. Do not repeat the raw excerpt text verbatim at length — synthesize and explain it in your own words, quoting only brief key phrases if truly helpful.\n" +
+    "5. Keep the answer focused and reasonably concise (a few short paragraphs at most).\n" +
+    "Output ONLY the explanation itself. No preamble like 'Based on the excerpts' and no restating the question.";
+
+  const userContent = "QUESTION: " + question + "\n\n" +
+    excerpts.map(function (e, i) {
+      return "EXCERPT " + (i + 1) + " (" + e.location + "):\n" + e.text;
+    }).join("\n\n---\n\n");
+
+  try {
+    const answer = await callOpenAI(env, systemPrompt, userContent, 0.4);
+    return jsonResponse({ answer });
+  } catch (err) {
+    return jsonResponse({ error: String(err.message || err) }, 502);
   }
 }
 
@@ -145,14 +189,15 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
     if (request.method !== "POST") {
-      return jsonResponse({ error: "Method not allowed. POST to /rewrite or /copyscape." }, 405);
+      return jsonResponse({ error: "Method not allowed. POST to /rewrite, /copyscape, or /bookqa." }, 405);
     }
 
     const url = new URL(request.url);
 
     if (url.pathname === "/rewrite") return handleRewrite(request, env);
     if (url.pathname === "/copyscape") return handleCopyscape(request, env);
+    if (url.pathname === "/bookqa") return handleBookQA(request, env);
 
-    return jsonResponse({ error: "Unknown route. Use POST /rewrite or POST /copyscape." }, 404);
+    return jsonResponse({ error: "Unknown route. Use POST /rewrite, /copyscape, or /bookqa." }, 404);
   },
 };
