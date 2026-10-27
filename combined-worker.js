@@ -1,17 +1,18 @@
 /**
  * Paper Toolkit — Combined Proxy Worker
  * ==========================================
- * ONE Cloudflare Worker handling THREE routes:
- *   POST /rewrite    -> AI rewrite (via OpenAI)
- *   POST /copyscape  -> Web plagiarism check (via Copyscape Premium API)
- *   POST /bookqa     -> AI explains an answer found in e-book excerpts (via OpenAI)
+ * ONE Cloudflare Worker handling FOUR routes:
+ * POST /rewrite    -> AI rewrite (via OpenAI)
+ * POST /copyscape  -> Web plagiarism check (via Copyscape Premium API)
+ * POST /bookqa     -> AI explains an answer found in e-book excerpts (via OpenAI)
+ * POST /fetch-url  -> Server-side fetch of a public link for the E-Books tab
  *
  * SETUP (after deploying this to a Worker)
  * -------------------------------------------------
  * Settings -> Variables and Secrets, add:
- *   OPENAI_API_KEY       = your OpenAI API key       (needed for /rewrite and /bookqa)
- *   COPYSCAPE_USERNAME    = your Copyscape username   (needed for /copyscape)
- *   COPYSCAPE_API_KEY     = your Copyscape API key    (needed for /copyscape)
+ * OPENAI_API_KEY = your OpenAI API key (needed for /rewrite and /bookqa)
+ * COPYSCAPE_USERNAME = your Copyscape username (needed for /copyscape)
+ * COPYSCAPE_API_KEY = your Copyscape API key (needed for /copyscape)
  *
  * You can add just OPENAI_API_KEY now and skip Copyscape until later.
  */
@@ -183,13 +184,98 @@ async function handleCopyscape(request, env) {
   }
 }
 
+async function handleFetchUrl(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+
+  const rawUrl = body.url;
+  if (!rawUrl) return jsonResponse({ error: "Missing url" }, 400);
+
+  let target;
+  try {
+    target = new URL(rawUrl);
+  } catch (e) {
+    return jsonResponse({ error: "Invalid URL" }, 400);
+  }
+
+  if (target.protocol !== "https:" && target.protocol !== "http:") {
+    return jsonResponse({ error: "Only http/https URLs are supported" }, 400);
+  }
+
+  try {
+    const upstream = await fetch(target.toString(), {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; PaperToolkitBot/1.0)" },
+      redirect: "follow",
+    });
+
+    if (!upstream.ok) {
+      return jsonResponse({ error: "Upstream returned status " + upstream.status }, 502);
+    }
+
+    const contentType = upstream.headers.get("content-type") || "";
+
+    if (contentType.includes("pdf")) {
+      const buf = await upstream.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let binary = "";
+      const chunkSize = 8192;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+      }
+      const base64 = btoa(binary);
+      return jsonResponse({ type: "pdf", base64: base64 });
+    }
+
+    if (contentType.includes("text/html") || contentType.includes("application/xhtml")) {
+      let title = "";
+      const textParts = [];
+      let skipDepth = 0;
+
+      const rewriter = new HTMLRewriter()
+        .on("title", { text(t) { title += t.text; } })
+        .on("script, style, nav, header, footer, noscript", {
+          element(el) {
+            skipDepth++;
+            el.onEndTag(function () { skipDepth = Math.max(0, skipDepth - 1); });
+          },
+        })
+        .on("body *", {
+          text(t) { if (skipDepth === 0 && t.text.trim()) textParts.push(t.text); },
+        });
+
+      const transformed = rewriter.transform(upstream);
+      await transformed.arrayBuffer();
+
+      const fullText = textParts.join(" ").replace(/\s+/g, " ").trim();
+      if (!fullText) {
+        return jsonResponse({ error: "Could not extract readable text from that page." }, 422);
+      }
+      return jsonResponse({ type: "text", text: fullText, title: title.trim() });
+    }
+
+    if (contentType.includes("text/plain")) {
+      const text = await upstream.text();
+      return jsonResponse({ type: "text", text: text });
+    }
+
+    return jsonResponse({ error: "Unsupported content type: " + contentType }, 415);
+  } catch (err) {
+    return jsonResponse({ error: "Request to fetch-url failed", detail: String(err) }, 502);
+  }
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: CORS_HEADERS });
     }
+
     if (request.method !== "POST") {
-      return jsonResponse({ error: "Method not allowed. POST to /rewrite, /copyscape, or /bookqa." }, 405);
+      return jsonResponse({ error: "Method not allowed. POST to /rewrite, /copyscape, /bookqa, or /fetch-url." }, 405);
     }
 
     const url = new URL(request.url);
@@ -197,7 +283,8 @@ export default {
     if (url.pathname === "/rewrite") return handleRewrite(request, env);
     if (url.pathname === "/copyscape") return handleCopyscape(request, env);
     if (url.pathname === "/bookqa") return handleBookQA(request, env);
+    if (url.pathname === "/fetch-url") return handleFetchUrl(request, env);
 
-    return jsonResponse({ error: "Unknown route. Use POST /rewrite, /copyscape, or /bookqa." }, 404);
+    return jsonResponse({ error: "Unknown route. Use POST /rewrite, /copyscape, /bookqa, or /fetch-url." }, 404);
   },
 };
