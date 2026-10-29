@@ -2,19 +2,17 @@
  * Paper Toolkit — Combined Proxy Worker
  * ==========================================
  * ONE Cloudflare Worker handling FOUR routes:
- * POST /rewrite    -> AI rewrite (via OpenAI)
+ * POST /rewrite    -> AI rewrite (via Anthropic Claude)
  * POST /copyscape  -> Web plagiarism check (via Copyscape Premium API)
- * POST /bookqa     -> AI explains an answer found in e-book excerpts (via OpenAI)
+ * POST /bookqa     -> AI explains an answer found in e-book excerpts (via Anthropic Claude)
  * POST /fetch-url  -> Server-side fetch of a public link for the E-Books tab
  *
  * SETUP (after deploying this to a Worker)
  * -------------------------------------------------
  * Settings -> Variables and Secrets, add:
- * OPENAI_API_KEY = your OpenAI API key (needed for /rewrite and /bookqa)
+ * ANTHROPIC_API_KEY = your Anthropic API key (needed for /rewrite and /bookqa)
  * COPYSCAPE_USERNAME = your Copyscape username (needed for /copyscape)
  * COPYSCAPE_API_KEY = your Copyscape API key (needed for /copyscape)
- *
- * You can add just OPENAI_API_KEY now and skip Copyscape until later.
  */
 
 const CORS_HEADERS = {
@@ -23,6 +21,8 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
+const CLAUDE_MODEL = "claude-sonnet-5-5";
+
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
@@ -30,27 +30,29 @@ function jsonResponse(obj, status = 200) {
   });
 }
 
-async function callOpenAI(env, systemPrompt, userContent, temperature) {
+async function callClaude(env, systemPrompt, userContent, temperature, maxTokens) {
   const payload = {
-    model: "gpt-4o-mini",
+    model: CLAUDE_MODEL,
+    max_tokens: maxTokens || 4096,
+    temperature: temperature,
+    system: systemPrompt,
     messages: [
-      { role: "system", content: systemPrompt },
       { role: "user", content: userContent },
     ],
-    temperature: temperature,
   };
-  const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
+  const aiResp = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: "Bearer " + env.OPENAI_API_KEY,
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify(payload),
   });
   const data = await aiResp.json();
-  if (data.error) throw new Error(data.error.message || "OpenAI API error");
-  const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content
-    ? data.choices[0].message.content.trim() : null;
+  if (data.error) throw new Error(data.error.message || "Claude API error");
+  const block = data.content && data.content[0];
+  const content = block && block.type === "text" ? block.text.trim() : null;
   if (!content) throw new Error("No content returned from model");
   return content;
 }
@@ -67,8 +69,8 @@ async function handleRewrite(request, env) {
   const targetWordCount = body.targetWordCount || null;
 
   if (!text.trim()) return jsonResponse({ error: "No text provided" }, 400);
-  if (!env.OPENAI_API_KEY) {
-    return jsonResponse({ error: "Server missing OPENAI_API_KEY. Add it as an encrypted secret in the Worker's settings." }, 500);
+  if (!env.ANTHROPIC_API_KEY) {
+    return jsonResponse({ error: "Server missing ANTHROPIC_API_KEY. Add it as an encrypted secret in the Worker's settings." }, 500);
   }
 
   const wordInstruction = targetWordCount
@@ -92,8 +94,10 @@ async function handleRewrite(request, env) {
     "- The final result should read as though the original author simply wrote a better second draft of their own paper.\n" +
     "- Output ONLY the rewritten paper text. No preamble, no explanation, no notes, no markdown formatting.";
 
+  const estimatedTokens = Math.min(8192, Math.max(2048, Math.ceil(text.split(/\s+/).length * 1.8)));
+
   try {
-    const rewritten = await callOpenAI(env, systemPrompt, text, 0.85);
+    const rewritten = await callClaude(env, systemPrompt, text, 0.85, estimatedTokens);
     return jsonResponse({ rewritten });
   } catch (err) {
     return jsonResponse({ error: String(err.message || err) }, 502);
@@ -113,8 +117,8 @@ async function handleBookQA(request, env) {
 
   if (!question.trim()) return jsonResponse({ error: "No question provided" }, 400);
   if (!excerpts.length) return jsonResponse({ error: "No excerpts provided" }, 400);
-  if (!env.OPENAI_API_KEY) {
-    return jsonResponse({ error: "Server missing OPENAI_API_KEY. Add it as an encrypted secret in the Worker's settings." }, 500);
+  if (!env.ANTHROPIC_API_KEY) {
+    return jsonResponse({ error: "Server missing ANTHROPIC_API_KEY. Add it as an encrypted secret in the Worker's settings." }, 500);
   }
 
   const systemPrompt = "You are a patient, knowledgeable study tutor helping a graduate student (a U.S. Navy service member working toward a Master's in Healthcare Administration) understand their textbook. " +
@@ -133,7 +137,7 @@ async function handleBookQA(request, env) {
     }).join("\n\n---\n\n");
 
   try {
-    const answer = await callOpenAI(env, systemPrompt, userContent, 0.4);
+    const answer = await callClaude(env, systemPrompt, userContent, 0.4, 1024);
     return jsonResponse({ answer });
   } catch (err) {
     return jsonResponse({ error: String(err.message || err) }, 502);
