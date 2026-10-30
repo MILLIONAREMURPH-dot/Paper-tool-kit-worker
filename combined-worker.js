@@ -13,6 +13,11 @@
  * ANTHROPIC_API_KEY = your Anthropic API key (needed for /rewrite and /bookqa)
  * COPYSCAPE_USERNAME = your Copyscape username (needed for /copyscape)
  * COPYSCAPE_API_KEY = your Copyscape API key (needed for /copyscape)
+ *
+ * NOTE: As of Anthropic API version 2026-10-21, the `temperature`, `top_p`,
+ * and `top_k` sampling parameters are no longer accepted for current models
+ * like Claude Sonnet 5.5 - any request including them returns a 400 error.
+ * This worker intentionally omits them and relies on prompt wording instead.
  */
 
 const CORS_HEADERS = {
@@ -30,11 +35,10 @@ function jsonResponse(obj, status = 200) {
   });
 }
 
-async function callClaude(env, systemPrompt, userContent, temperature, maxTokens) {
+async function callClaude(env, systemPrompt, userContent, maxTokens) {
   const payload = {
     model: CLAUDE_MODEL,
     max_tokens: maxTokens || 4096,
-    temperature: temperature,
     system: systemPrompt,
     messages: [
       { role: "user", content: userContent },
@@ -97,7 +101,7 @@ async function handleRewrite(request, env) {
   const estimatedTokens = Math.min(8192, Math.max(2048, Math.ceil(text.split(/\s+/).length * 1.8)));
 
   try {
-    const rewritten = await callClaude(env, systemPrompt, text, 0.85, estimatedTokens);
+    const rewritten = await callClaude(env, systemPrompt, text, estimatedTokens);
     return jsonResponse({ rewritten });
   } catch (err) {
     return jsonResponse({ error: String(err.message || err) }, 502);
@@ -137,7 +141,7 @@ async function handleBookQA(request, env) {
     }).join("\n\n---\n\n");
 
   try {
-    const answer = await callClaude(env, systemPrompt, userContent, 0.4, 1024);
+    const answer = await callClaude(env, systemPrompt, userContent, 1024);
     return jsonResponse({ answer });
   } catch (err) {
     return jsonResponse({ error: String(err.message || err) }, 502);
