@@ -14,10 +14,16 @@
  * COPYSCAPE_USERNAME = your Copyscape username (needed for /copyscape)
  * COPYSCAPE_API_KEY = your Copyscape API key (needed for /copyscape)
  *
- * NOTE: As of Anthropic API version 2026-10-21, the `temperature`, `top_p`,
- * and `top_k` sampling parameters are no longer accepted for current models
- * like Claude Sonnet 5.5 - any request including them returns a 400 error.
- * This worker intentionally omits them and relies on prompt wording instead.
+ * NOTES:
+ * - As of Anthropic API version 2026-10-21, the `temperature`, `top_p`,
+ *   and `top_k` sampling parameters are no longer accepted for current
+ *   models like Claude Sonnet 5.5 - any request including them returns
+ *   a 400 error. This worker intentionally omits them.
+ * - Claude Sonnet 5.5 always uses extended thinking and it cannot be
+ *   disabled. Responses include a "thinking" content block BEFORE the
+ *   actual "text" block, so we scan all blocks for type "text" rather
+ *   than assuming content[0] is the answer. max_tokens is also sized
+ *   generously so thinking doesn't crowd out the actual output.
  */
 
 const CORS_HEADERS = {
@@ -33,6 +39,13 @@ function jsonResponse(obj, status = 200) {
     status,
     headers: { "Content-Type": "application/json", ...CORS_HEADERS },
   });
+}
+
+function extractClaudeText(data) {
+  const blocks = Array.isArray(data.content) ? data.content : [];
+  const textBlocks = blocks.filter(function (b) { return b.type === "text" && b.text; });
+  if (!textBlocks.length) return null;
+  return textBlocks.map(function (b) { return b.text; }).join("").trim();
 }
 
 async function callClaude(env, systemPrompt, userContent, maxTokens) {
@@ -55,9 +68,11 @@ async function callClaude(env, systemPrompt, userContent, maxTokens) {
   });
   const data = await aiResp.json();
   if (data.error) throw new Error(data.error.message || "Claude API error");
-  const block = data.content && data.content[0];
-  const content = block && block.type === "text" ? block.text.trim() : null;
-  if (!content) throw new Error("No content returned from model");
+  const content = extractClaudeText(data);
+  if (!content) {
+    const stopReason = data.stop_reason ? (" (stop_reason: " + data.stop_reason + ")") : "";
+    throw new Error("No text content returned from model" + stopReason);
+  }
   return content;
 }
 
@@ -98,7 +113,8 @@ async function handleRewrite(request, env) {
     "- The final result should read as though the original author simply wrote a better second draft of their own paper.\n" +
     "- Output ONLY the rewritten paper text. No preamble, no explanation, no notes, no markdown formatting.";
 
-  const estimatedTokens = Math.min(8192, Math.max(2048, Math.ceil(text.split(/\s+/).length * 1.8)));
+  const wordCount = text.split(/\s+/).filter(Boolean).length;
+  const estimatedTokens = Math.min(16000, Math.max(4096, Math.ceil(wordCount * 2.2) + 2000));
 
   try {
     const rewritten = await callClaude(env, systemPrompt, text, estimatedTokens);
@@ -141,7 +157,7 @@ async function handleBookQA(request, env) {
     }).join("\n\n---\n\n");
 
   try {
-    const answer = await callClaude(env, systemPrompt, userContent, 1024);
+    const answer = await callClaude(env, systemPrompt, userContent, 3000);
     return jsonResponse({ answer });
   } catch (err) {
     return jsonResponse({ error: String(err.message || err) }, 502);
