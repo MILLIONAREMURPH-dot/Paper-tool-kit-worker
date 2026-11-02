@@ -24,6 +24,9 @@
  *   actual "text" block, so we scan all blocks for type "text" rather
  *   than assuming content[0] is the answer. max_tokens is also sized
  *   generously so thinking doesn't crowd out the actual output.
+ * - /rewrite accepts an optional "intensity" field: "light", "standard"
+ *   (default), or "aggressive". This changes the restructuring
+ *   instructions sent to Claude, not just a cosmetic label.
  */
 
 const CORS_HEADERS = {
@@ -76,6 +79,20 @@ async function callClaude(env, systemPrompt, userContent, maxTokens) {
   return content;
 }
 
+const INTENSITY_INSTRUCTIONS = {
+  light: "INTENSITY LEVEL: LIGHT EDIT\n" +
+    "- Make lighter, more conservative edits: improve word choice, fix awkward phrasing, and smooth transitions.\n" +
+    "- You may keep sentence boundaries and overall paragraph order largely similar to the original.\n" +
+    "- Still avoid copying long verbatim phrases outside of direct quotations.",
+  standard: "INTENSITY LEVEL: STANDARD\n" +
+    "- Follow the structure and originality guidance above as written, with a normal degree of restructuring.",
+  aggressive: "INTENSITY LEVEL: AGGRESSIVE RESTRUCTURE\n" +
+    "- Push significantly harder on originality than a standard pass. Change sentence boundaries throughout: merge short sentences, split long ones, and reverse or vary clause order.\n" +
+    "- Reorder paragraphs more freely where it does not harm clarity, and use substantially different vocabulary and sentence openers wherever possible.\n" +
+    "- Aim for virtually no run of more than 4-5 consecutive words matching the original's exact wording, except for direct quotations, citations, proper nouns, and necessary technical or clinical terminology that cannot be reworded without changing meaning.\n" +
+    "- This is still the SAME paper with the same facts, thesis, and citations - just maximally restructured prose, not a different paper.",
+};
+
 async function handleRewrite(request, env) {
   let body;
   try {
@@ -86,6 +103,7 @@ async function handleRewrite(request, env) {
 
   const text = (body.text || "").slice(0, 20000);
   const targetWordCount = body.targetWordCount || null;
+  const intensity = ["light", "standard", "aggressive"].includes(body.intensity) ? body.intensity : "standard";
 
   if (!text.trim()) return jsonResponse({ error: "No text provided" }, 400);
   if (!env.ANTHROPIC_API_KEY) {
@@ -110,11 +128,13 @@ async function handleRewrite(request, env) {
     "- Prioritize smooth, logical paragraph-to-paragraph flow with natural transitions rather than formulaic connectors.\n" +
     "- Avoid common AI writing tells: do not overuse words like 'delve,' 'underscore,' 'furthermore,' 'in conclusion,' 'it is important to note,' or 'leverage'; avoid repetitive sentence openers; avoid excessive hedging or robotic uniform sentence lengths.\n" +
     "- Write at the register appropriate for a Master's-level academic audience: precise, substantive, and confident, without sounding stiff or artificially polished.\n" +
-    "- The final result should read as though the original author simply wrote a better second draft of their own paper.\n" +
+    "- The final result should read as though the original author simply wrote a better second draft of their own paper.\n\n" +
+    INTENSITY_INSTRUCTIONS[intensity] + "\n\n" +
     "- Output ONLY the rewritten paper text. No preamble, no explanation, no notes, no markdown formatting.";
 
   const wordCount = text.split(/\s+/).filter(Boolean).length;
-  const estimatedTokens = Math.min(16000, Math.max(4096, Math.ceil(wordCount * 2.2) + 2000));
+  const tokenMultiplier = intensity === "aggressive" ? 2.6 : 2.2;
+  const estimatedTokens = Math.min(16000, Math.max(4096, Math.ceil(wordCount * tokenMultiplier) + 2000));
 
   try {
     const rewritten = await callClaude(env, systemPrompt, text, estimatedTokens);
